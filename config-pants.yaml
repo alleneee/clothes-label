@@ -1,0 +1,241 @@
+# 增强版衣服12分类配置
+# 目标：提升准确率到80%+
+
+# 数据配置
+data:
+  data_dir: "datasets/main/pants/train"
+  dataset_name: "pants_classification_v1"
+  batch_size: 64                           
+  image_size: 448                          
+  num_workers: 12                          
+  auto_split: true
+  train_split: 0.8
+  val_split: 0.2
+  test_split: 0.0
+  
+  # 优化数据增强 - 去除有害增强，保留有益增强
+  augmentation:
+    enabled: true
+    
+    # 几何变换 - 大幅减少影响身体比例的变换
+    rotation_degrees: 5                    # 减少：15→5
+    horizontal_flip: 0.5                   # 保留：有益
+    vertical_flip: 0.0                     # 禁用：0.1→0.0（无意义）
+    scale_range: [0.98, 1.02]              # 大幅减少：[0.8,1.2]→[0.98,1.02]
+    translate_percent: 0.0                 # 禁用：0.1→0.0（会裁剪身体）
+    
+    # 颜色增强 - 保留但略微减少强度
+    brightness: 0.15                       # 略减少：0.2→0.15
+    contrast: 0.15                         # 略减少：0.2→0.15
+    saturation: 0.15                       # 略减少：0.2→0.15
+    hue: 0.05                              # 减少：0.1→0.05
+    
+    # 高级增强 - 保留轻微的纹理增强
+    gaussian_blur: 0.05                    # 减少：0.1→0.05
+    sharpen: 0.05                          # 减少：0.1→0.05
+    emboss: 0.0                            # 禁用：0.05→0.0
+    edge_enhance: 0.0                      # 禁用：0.05→0.0
+    
+    # 噪声和遮挡 - 禁用所有会影响身体的增强
+    gaussian_noise: 0.03                   # 大幅减少：0.1→0.03
+    dropout: 0.0                           # 禁用：0.05→0.0
+    cutout_holes: 0                        # 禁用：2→0（会破坏身体完整性）
+    cutout_size: 0.0                       # 禁用：0.1→0.0
+    
+    # Mixup和CutMix - 禁用CutMix，保留轻微Mixup
+    mixup_alpha: 0.1                       # 减少：0.2→0.1
+    cutmix_alpha: 0.0                      # 禁用：1.0→0.0（会裁剪身体）
+    cutmix_prob: 0.0                       # 禁用：0.5→0.0
+  
+  # 数据加载优化
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4                       # 增加预取因子
+
+# 模型配置 - 使用更大的模型
+model:
+  name: "efficientnetv2_rw_s.ra2_in1k"     # 使用原始小模型，通过其他方式提高显存利用率
+  pretrained: true                         # 启用预训练权重
+  local_pretrained_path: "/root/.cache/modelscope/hub/models/timm/efficientnetv2_rw_s.ra2_in1k/pytorch_model.bin"
+  num_classes: 10
+  learning_rate: 0.001                     # 适应更大批次的学习率
+  weight_decay: 0.0002                     # 增加权重衰减
+  
+  # 更强的正则化
+  drop_rate: 0.4                          # 增加dropout
+  drop_path_rate: 0.2                     # 增加drop path
+  label_smoothing: 0.15                   # 增加标签平滑
+  
+  # 优化器配置
+  optimizer:
+    type: "adamw"                         # 使用AdamW优化器
+    betas: [0.9, 0.999]
+    eps: 1e-8
+    amsgrad: false
+
+# 训练配置
+training:
+  max_epochs: 100                         # 增加训练轮数
+  patience: 15                            # 增加早停耐心
+  mixed_precision: true
+  gradient_clip_val: 2.0                  # 增加梯度裁剪
+  accumulate_grad_batches: 2              # 增加梯度累积，等效更大批次
+  
+  # 更复杂的学习率调度
+  scheduler:
+    type: "cosine_annealing_warm_restarts" # 使用热重启
+    T_0: 10                               # 初始周期
+    T_mult: 2                             # 周期倍增因子
+    eta_min: 1e-7                         # 最小学习率
+    warmup_epochs: 5                      # 预热轮数
+    warmup_start_lr: 1e-6                 # 预热起始学习率
+
+  # 检查点配置
+  checkpoint:
+    monitor: "val_acc"
+    mode: "max"
+    save_top_k: 2                         # 只保留2个最佳检查点
+    save_last: true
+    every_n_epochs: 3                     # 更频繁保存
+    filename: "pants-{epoch:02d}-{val_acc:.3f}"
+
+  # 早停配置
+  early_stopping:
+    monitor: "val_acc"
+    patience: 15                          # 更大的耐心
+    mode: "max"
+    min_delta: 0.005                      # 更小的最小改进
+
+# 多GPU配置
+multi_gpu:
+  strategy: "ddp"                         # 明确指定分布式策略
+  precision: 16
+  find_unused_parameters: false
+
+# 数据不均衡处理 - 强化版
+imbalance:
+  enabled: true
+  auto_detect: true
+  threshold: 2.0                          # 更严格的不平衡阈值
+  strategy: "comprehensive"               # 综合策略
+  
+  # 采样策略
+  sampling:
+    method: "balanced_batch"              # 平衡批次采样
+    replacement: true
+    oversample_factor: 2.0                # 增加过采样因子
+    undersample_factor: 0.8               # 适度欠采样
+    
+  # 损失函数
+  loss:
+    type: "focal_with_class_weights"      # 结合类别权重的Focal Loss
+    focal:
+      alpha: 0.25                         # 调整alpha
+      gamma: 2.5                          # 增加gamma
+    weight_method: "effective_number"     # 有效数量加权
+    beta: 0.9999                          # 有效数量参数
+
+# 高级训练技巧
+advanced_training:
+  # 知识蒸馏（如果有预训练模型）
+  knowledge_distillation:
+    enabled: false
+    temperature: 4.0
+    alpha: 0.7
+  
+  # 自适应训练
+  adaptive:
+    enabled: true
+    lr_finder: true                       # 自动寻找最佳学习率
+    auto_batch_size: false                 # 启用自动批次大小，最大化显存利用率
+    
+  # 测试时增强
+  test_time_augmentation:
+    enabled: true
+    num_augments: 5                       # TTA次数
+    
+  # 模型集成
+  ensemble:
+    enabled: false                        # 可选：训练多个模型集成
+    num_models: 3
+
+# 验证和测试
+validation:
+  check_val_every_n_epoch: 1
+  val_check_interval: 0.5                 # 每半个epoch验证一次
+  limit_val_batches: 1.0
+  num_sanity_val_steps: 5                 # 增加sanity检查
+
+# 日志和监控
+logging:
+  log_dir: "logs"
+  experiment_name: "pants_classification"
+  
+  # 详细监控
+  log_gpu_memory: true
+  log_gpu_utilization: true
+  profile_training: true                  # 启用性能分析
+  log_learning_rate: true                 # 记录学习率变化
+  log_gradient_norm: true                 # 记录梯度范数
+  
+  # 可视化
+  log_images: true                        # 记录样本图片
+  log_predictions: true                   # 记录预测结果
+  log_confusion_matrix: true              # 记录混淆矩阵
+
+# 检查点配置
+checkpointing:
+  monitor: "val_acc"
+  mode: "max"
+  save_top_k: 2
+  save_last: true
+  filename: "pants-{epoch:02d}-{val_acc:.3f}"
+  dirpath: "model/checkpoints_pants"
+  
+  # 优化保存
+  save_weights_only: false
+  async_save: true
+  every_n_train_steps: 500               # 按步数保存
+
+# 环境优化
+environment_variables:
+  HF_ENDPOINT: "https://hf-mirror.com"
+  CUDA_LAUNCH_BLOCKING: "1"
+  TORCH_CUDNN_V8_API_ENABLED: "1"
+  OMP_NUM_THREADS: "8"                   # 增加线程数
+  CUDA_VISIBLE_DEVICES: "1"           
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"  # 优化内存分配
+
+# 性能优化
+performance:
+  # 内存优化
+  empty_cache_steps: 25                   # 更频繁清理缓存
+  gc_collect_steps: 50                    # 更频繁垃圾回收
+  
+  # 计算优化
+  benchmark: true
+  deterministic: false                    # 允许非确定性以提高性能
+  enable_graph_optimization: true        # 图优化
+  
+  # PyTorch 2.0 编译优化 - 单卡训练优化
+  enable_torch_compile: false             # 禁用torch.compile()优化（避免兼容性问题）
+  torch_compile_mode: "reduce-overhead"   # 编译模式: default, reduce-overhead, max-autotune
+  
+  # 数据加载优化
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+
+# 类别信息
+classes:
+  auto_detect: false
+  names: ['全身模特', '其他角度', '口袋特写', '商标特写', '正面平铺', '正面模特', '背面平铺', '背面模特', '腰部特写', '裤脚特写']
+  num_classes: 10
+  
+  # 类别权重（基于数据分布自动计算）
+  class_weights: "auto"
+  
+  # 困难样本挖掘
+  hard_mining:
+    enabled: true
+    ratio: 0.3                            # 困难样本比例
+    update_freq: 5                        # 更新频率 

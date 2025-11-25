@@ -1,0 +1,71 @@
+# 模型文件和检查点
+model/
+model/checkpoints_*/
+model/*.pth
+model/*.pt
+model/*.pkl
+model/*.h5
+model/*.ckpt
+model/*.pb
+model/*.onnx
+
+# 日志文件
+logs/
+*.log
+
+# 数据集文件
+datasets/
+data/
+*.csv
+*.json
+*.parquet
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+.cache/
+
+# 进程ID文件
+*.pid
+
+# 运行时生成的文件
+confusion_matrix.png
+simple_api.log 
