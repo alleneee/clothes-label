@@ -1,10 +1,12 @@
 """裤子处理全流程服务"""
 import json
 import logging
-from typing import List, Dict, Any, Optional, Callable
+import re
+from typing import List, Dict, Any, Optional, Callable, Tuple
 import requests
 from io import BytesIO
 from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -139,103 +141,213 @@ class PantsWorkflowService:
         Returns:
             最终的打标结果列表
         """
-        # 1. 解析图片列表
-        logger.info(f"开始处理品牌{brand}, 货号{product_code}的图片列表")
-        pic_list = self.parse_pic_list(pic_list_str)
+        if brand == "LN":
+            return self._process_ln_brand(
+                product_code=product_code,
+                pic_list_str=pic_list_str,
+                picture_type=picture_type
+            )
+        else:    
+            # 1. 解析图片列表
+            logger.info(f"开始处理品牌{brand}, 货号{product_code}的图片列表")
+            pic_list = self.parse_pic_list(pic_list_str)
+            
+            if not pic_list:
+                raise ValueError("图片列表为空")
+            
+            # 2. 批量分类图片
+            logger.info(f"品牌{brand}, 货号{product_code}, 开始批量分类{len(pic_list)}张图片")
+            classification_results = self.classify_images(pic_list, predict_func)
+            logger.info(f"品牌{brand}, 货号{product_code}, 分类完成: {classification_results}")
+            
+            if not classification_results:
+                raise ValueError("没有成功分类的图片")
+            
+            # 3. 构建LabelResult列表
+            logger.info(f"品牌{brand}, 货号{product_code}, 构建打标结果列表，共{len(classification_results)}个结果")
+            from core.pants_labeling_service import LabelResult
+            
+            label_results = [
+                LabelResult(
+                    brand=brand,
+                    pic_id=item["pic_id"],
+                    type=item["type"],
+                    size=item["size"],
+                    confidence=item["confidence"],
+                    pic_name=item["pic_name"],
+                    product_code=product_code
+                )
+                for item in classification_results
+            ]
+            
+            # 4. 调用打标服务
+            logger.info(f"品牌{brand}, 货号{product_code}, 开始调用打标服务")
+            if not self.labeling_service:
+                raise ValueError("打标服务未初始化")
+            
+            ordered = self.labeling_service.select_images(label_results)
+            logger.info(f"品牌{brand}, 货号{product_code}, 打标完成: {ordered}")
+            
+            # 5. 处理文件名，使用原始product_code
+            logger.info(f"品牌{brand}, 货号{product_code}, 开始处理文件名和OSS重命名")
+            
+            result_list = []
+            for idx, record in enumerate(ordered[:6]):
+                # 替换文件名中的product_code为原始字符串
+                original_filename = record['new_file_name']
+                file_path = Path(original_filename)
+                suffix = file_path.suffix
+                
+                # 从文件名中提取code部分（例如：12345_01.jpg -> 01）
+                filename_parts = file_path.stem.split('_')
+                if len(filename_parts) >= 2:
+                    code = filename_parts[-1]
+                    new_filename = f"{product_code}_{code}{suffix}"
+                else:
+                    new_filename = original_filename
+                
+                # 6. 如果需要，在OSS中重命名文件
+                # 生成新的文件路径
+                new_path = self.generate_new_file_path(
+                    new_file_name=new_filename,
+                    brand=brand,
+                    product_code=product_code,
+                    picture_type=picture_type
+                )
+                
+                # 调用OSS重命名接口
+                renamed_file = self.rename_file_in_oss(
+                    old_name=record['item'].pic_name,
+                    new_name=new_path
+                )
+                
+                # 如果重命名成功，记录日志
+                if renamed_file:
+                    logger.info(f"品牌{brand}, 货号{product_code}, OSS重命名成功: {record['item'].pic_name} -> {renamed_file}")
+                
+                result_list.append({
+                    "product_code": product_code,
+                    "tag_first_type": "1",
+                    "tag_second_type": "11",
+                    "tag_result": record['item'].type_code,
+                    "pic_id": record['item'].pic_id,
+                    "type": record['item'].type,
+                    "type_code": record['item'].type_code,
+                    "size": record['item'].size,
+                    "confidence": record['item'].confidence,
+                    "pic_name": record['item'].pic_name,  # 保持原始文件名
+                    "new_file_name": new_filename,
+                    "return_content_name": renamed_file,
+                    "original_file_name": record['item'].pic_name,
+                    "return_content_type": picture_type  # 使用传入的picture_type
+                })
+            
+            logger.info(f"品牌{brand}, 货号{product_code}, 完整流程处理完成，返回{len(result_list)}个结果")
+            return result_list
+    
+    def _process_ln_brand(
+        self,
+        product_code: str,
+        pic_list_str: str,
+        picture_type: str = "pants"
+    ) -> List[Dict[str, Any]]:
+        """
+        处理李宁(LN)品牌的图片选择逻辑
         
+        只保留文件名中带WHITE的图片，WHITE之后的数字为序号，保留序号1-6。
+        新文件名格式: product_code_序号.后缀
+        示例: AKLV217-5-MXK-WHITE-1.jpg -> product_code_01.jpg
+        """
+        logger.info(f"开始处理品牌-李宁, 货号{product_code}的图片列表")
+        
+        # 1. 解析图片列表
+        pic_list = self.parse_pic_list(pic_list_str)
         if not pic_list:
             raise ValueError("图片列表为空")
         
-        # 2. 批量分类图片
-        logger.info(f"品牌{brand}, 货号{product_code}, 开始批量分类{len(pic_list)}张图片")
-        classification_results = self.classify_images(pic_list, predict_func)
-        logger.info(f"品牌{brand}, 货号{product_code}, 分类完成: {classification_results}")
+        logger.info(f"品牌LN, 货号{product_code}, 共{len(pic_list)}张图片")
         
-        if not classification_results:
-            raise ValueError("没有成功分类的图片")
+        # 2. 提取WHITE图片及其序号
+        white_items: List[Tuple[int, Dict[str, Any]]] = []
+        for pic_info in pic_list:
+            pic_name = pic_info.get("pic_name", "")
+            seq = self._extract_ln_white_sequence(pic_name)
+            if seq is not None and 1 <= seq <= 6:
+                white_items.append((seq, pic_info))
         
-        # 3. 构建LabelResult列表
-        logger.info(f"品牌{brand}, 货号{product_code}, 构建打标结果列表，共{len(classification_results)}个结果")
-        from core.pants_labeling_service import LabelResult
+        if not white_items:
+            logger.warning(f"品牌LN, 货号{product_code}, 没有找到符合条件的WHITE图片")
+            return []
         
-        label_results = [
-            LabelResult(
-                brand=brand,
-                pic_id=item["pic_id"],
-                type=item["type"],
-                size=item["size"],
-                confidence=item["confidence"],
-                pic_name=item["pic_name"],
-                product_code=product_code
-            )
-            for item in classification_results
-        ]
+        # 3. 按序号排序，去重（同一序号取第一个）
+        white_items.sort(key=lambda x: x[0])
+        seen_seq: set = set()
+        selected_items: List[Tuple[int, Dict[str, Any]]] = []
+        for seq, pic_info in white_items:
+            if seq not in seen_seq:
+                seen_seq.add(seq)
+                selected_items.append((seq, pic_info))
         
-        # 4. 调用打标服务
-        logger.info(f"品牌{brand}, 货号{product_code}, 开始调用打标服务")
-        if not self.labeling_service:
-            raise ValueError("打标服务未初始化")
+        logger.info(f"品牌LN, 货号{product_code}, 筛选出{len(selected_items)}张WHITE图片")
         
-        ordered = self.labeling_service.select_images(label_results)
-        logger.info(f"品牌{brand}, 货号{product_code}, 打标完成: {ordered}")
-        
-        # 5. 处理文件名，使用原始product_code
-        logger.info(f"品牌{brand}, 货号{product_code}, 开始处理文件名和OSS重命名")
-        from pathlib import Path
-        
+        # 4. 生成结果列表
         result_list = []
-        for idx, record in enumerate(ordered[:6]):
-            # 替换文件名中的product_code为原始字符串
-            original_filename = record['new_file_name']
-            file_path = Path(original_filename)
-            suffix = file_path.suffix
+        for seq, pic_info in selected_items:
+            pic_name = pic_info.get("pic_name", "")
+            pic_id = pic_info.get("pic_id")
             
-            # 从文件名中提取code部分（例如：12345_01.jpg -> 01）
-            filename_parts = file_path.stem.split('_')
-            if len(filename_parts) >= 2:
-                code = filename_parts[-1]
-                new_filename = f"{product_code}_{code}{suffix}"
-            else:
-                new_filename = original_filename
+            # 获取原始文件后缀
+            suffix = Path(pic_name).suffix or ".jpg"
             
-            # 6. 如果需要，在OSS中重命名文件
-            # 生成新的文件路径
+            # 生成新文件名: product_code_序号.后缀
+            new_filename = f"{product_code}_{seq:02d}{suffix}"
+            
+            # 生成OSS新路径
             new_path = self.generate_new_file_path(
                 new_file_name=new_filename,
-                brand=brand,
+                brand="LN",
                 product_code=product_code,
                 picture_type=picture_type
             )
             
             # 调用OSS重命名接口
             renamed_file = self.rename_file_in_oss(
-                old_name=record['item'].pic_name,
+                old_name=pic_name,
                 new_name=new_path
             )
             
-            # 如果重命名成功，记录日志
             if renamed_file:
-                logger.info(f"品牌{brand}, 货号{product_code}, OSS重命名成功: {record['item'].pic_name} -> {renamed_file}")
+                logger.info(f"品牌LN, 货号{product_code}, OSS重命名成功: {pic_name} -> {renamed_file}")
             
             result_list.append({
                 "product_code": product_code,
                 "tag_first_type": "1",
                 "tag_second_type": "11",
-                "tag_result": record['item'].type_code,
-                "pic_id": record['item'].pic_id,
-                "type": record['item'].type,
-                "type_code": record['item'].type_code,
-                "size": record['item'].size,
-                "confidence": record['item'].confidence,
-                "pic_name": record['item'].pic_name,  # 保持原始文件名
+                "tag_result": None,
+                "pic_id": pic_id,
+                "type": seq,
+                "type_code": seq,
+                "size": 0,
+                "confidence": 1.0,
+                "pic_name": pic_name,
                 "new_file_name": new_filename,
                 "return_content_name": renamed_file,
-                "original_file_name": record['item'].pic_name,
-                "return_content_type": picture_type  # 使用传入的picture_type
+                "original_file_name": pic_name,
+                "return_content_type": picture_type
             })
         
-        logger.info(f"品牌{brand}, 货号{product_code}, 完整流程处理完成，返回{len(result_list)}个结果")
+        logger.info(f"品牌LN, 货号{product_code}, 完整流程处理完成，返回{len(result_list)}个结果")
         return result_list
+    
+    def _extract_ln_white_sequence(self, pic_name: str) -> Optional[int]:
+        """从文件名中提取WHITE后面的序号。
+        
+        示例: AKLV217-5-MXK-WHITE-1.jpg -> 1
+        """
+        match = re.search(r'WHITE[-_]?(\d+)', pic_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
     
     def generate_new_file_path(
         self,

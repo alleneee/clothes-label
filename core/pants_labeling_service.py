@@ -1,6 +1,7 @@
 """Pants labeling service with brand-specific selection rules."""
 import json
-from typing import List, Dict, Any, Optional, Set
+import re
+from typing import List, Dict, Any, Optional, Set, Tuple
 from pathlib import Path
 
 from pydantic import BaseModel, model_validator
@@ -189,29 +190,38 @@ class PantsLabelingService:
     def _select_ln_brand_images(self, items: List[LabelResult]) -> List[Dict[str, Any]]:
         """LN品牌选图：
 
-        1. 依次优先腰部、口袋、裤脚、商标等细节特写。
-        2. 若细节不足，再引入正面模特、全身模特、正面平铺。
-        3. 其余位置交由兜底逻辑填充，确保至少包含模特视角。
+        只保留文件名中带WHITE的图片，WHITE之后的数字为命名序号，保留序号1-6。
+        示例命名: AKLV217-5-MXK-WHITE-1.jpg
         """
-        grouped = self._group_by_type(items)
-        used_ids: Set[int] = set()
         ordered: List[Dict[str, Any]] = []
-
-        def append_item(candidate: Optional[LabelResult], rule_desc: str):
-            if candidate:
-                ordered.append({"item": candidate, "rule": rule_desc})
-
-        # 优先挑选细节
-        for detail_type in ["腰部特写", "口袋特写", "裤脚特写", "商标特写"]:
-            append_item(self._pick_best_of_type(grouped, detail_type, used_ids), f"LN规则: {detail_type}")
-
-        # 再挑选模特和平铺
-        append_item(self._pick_best_of_type(grouped, "正面模特", used_ids), "LN规则: 正面模特")
-        append_item(self._pick_best_of_type(grouped, "全身模特", used_ids), "LN规则: 全身模特")
-        append_item(self._pick_best_of_type(grouped, "正面平铺", used_ids), "LN规则: 正面平铺")
-
-        self._fill_remaining(items, used_ids, ordered)
+        
+        # 提取WHITE图片及其序号
+        white_items: List[Tuple[int, LabelResult]] = []
+        for item in items:
+            seq = self._extract_ln_white_sequence(item.pic_name)
+            if seq is not None and 1 <= seq <= 6:
+                white_items.append((seq, item))
+        
+        # 按序号排序，去重（同一序号取第一个）
+        white_items.sort(key=lambda x: x[0])
+        seen_seq: Set[int] = set()
+        for seq, item in white_items:
+            if seq not in seen_seq:
+                seen_seq.add(seq)
+                ordered.append({"item": item, "rule": f"LN规则: WHITE序号{seq}"})
+        
         return ordered
+
+    def _extract_ln_white_sequence(self, pic_name: str) -> Optional[int]:
+        """从文件名中提取WHITE后面的序号。
+        
+        示例: AKLV217-5-MXK-WHITE-1.jpg -> 1
+        """
+        # 匹配 WHITE 后面跟着的数字（可能有分隔符如 - 或 _）
+        match = re.search(r'WHITE[-_]?(\d+)', pic_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
 
     def _select_default_images(self, items: List[LabelResult]) -> List[Dict[str, Any]]:
         ordered: List[Dict[str, Any]] = []
@@ -372,14 +382,14 @@ if __name__ == "__main__":
     print("测试NK品牌选图")
     print("=" * 60)
     nk_items = [
-        LabelResult(brand="NK", pic_id=1, type="正面模特", size=100, confidence=0.9, pic_name="front_model.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=2, type="背面模特", size=100, confidence=0.9, pic_name="back_model.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=3, type="全身模特", size=100, confidence=0.9, pic_name="full_body.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=4, type="口袋特写", size=100, confidence=0.9, pic_name="pocket.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=5, type="裤脚特写", size=100, confidence=0.9, pic_name="crotch.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=6, type="腰部特写", size=100, confidence=0.9, pic_name="waist.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=7, type="商标特写", size=100, confidence=0.9, pic_name="logo.jpg", product_code=12345),
-        LabelResult(brand="NK", pic_id=8, type="其他细节", size=100, confidence=0.9, pic_name="other.jpg", product_code=12345),
+        LabelResult(brand="NK", pic_id=1, type="正面模特", size=100, confidence=0.9, pic_name="front_model.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=2, type="背面模特", size=100, confidence=0.9, pic_name="back_model.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=3, type="全身模特", size=100, confidence=0.9, pic_name="full_body.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=4, type="口袋特写", size=100, confidence=0.9, pic_name="pocket.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=5, type="裤脚特写", size=100, confidence=0.9, pic_name="crotch.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=6, type="腰部特写", size=100, confidence=0.9, pic_name="waist.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=7, type="商标特写", size=100, confidence=0.9, pic_name="logo.jpg", product_code="12345"),
+        LabelResult(brand="NK", pic_id=8, type="其他细节", size=100, confidence=0.9, pic_name="other.jpg", product_code="12345"),
     ]
     nk_result = service.select_images(nk_items)
     # 转换为可JSON序列化的格式
@@ -406,14 +416,14 @@ if __name__ == "__main__":
     print("测试AD品牌选图")
     print("=" * 60)
     ad_items = [
-        LabelResult(brand="AD", pic_id=1, type="正面模特", size=100, confidence=0.9, pic_name="front_model.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=2, type="正面平铺", size=100, confidence=0.9, pic_name="front_flat.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=3, type="背面模特", size=100, confidence=0.9, pic_name="back_model.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=4, type="全身模特", size=100, confidence=0.9, pic_name="full_body.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=5, type="口袋特写", size=100, confidence=0.9, pic_name="pocket.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=6, type="裤脚特写", size=100, confidence=0.9, pic_name="crotch.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=7, type="腰部特写", size=100, confidence=0.9, pic_name="waist.jpg", product_code=67890),
-        LabelResult(brand="AD", pic_id=8, type="商标特写", size=100, confidence=0.9, pic_name="logo.jpg", product_code=67890),
+        LabelResult(brand="AD", pic_id=1, type="正面模特", size=100, confidence=0.9, pic_name="front_model.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=2, type="正面平铺", size=100, confidence=0.9, pic_name="front_flat.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=3, type="背面模特", size=100, confidence=0.9, pic_name="back_model.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=4, type="全身模特", size=100, confidence=0.9, pic_name="full_body.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=5, type="口袋特写", size=100, confidence=0.9, pic_name="pocket.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=6, type="裤脚特写", size=100, confidence=0.9, pic_name="crotch.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=7, type="腰部特写", size=100, confidence=0.9, pic_name="waist.jpg", product_code="67890"),
+        LabelResult(brand="AD", pic_id=8, type="商标特写", size=100, confidence=0.9, pic_name="logo.jpg", product_code="67890"),
     ]
     ad_result = service.select_images(ad_items)
     # 转换为可JSON序列化的格式
@@ -435,3 +445,57 @@ if __name__ == "__main__":
     # for idx, record in enumerate(ad_result, 1):
     #     item = record['item']
     #     print(f"{idx}. {item.type} (type_code: {item.type_code}) - {record['rule']} - {record['new_file_name']}")
+
+    print("\n" + "=" * 60)
+    print("测试LN品牌选图 - WHITE文件名过滤")
+    print("=" * 60)
+    # 使用真实示例文件名
+    ln_filenames = [
+        "AKLV217-5-MXK-DIAOPAI-1.jpg",
+        "AKLV217-5-MXK-DIAOPAI-2.jpg",
+        "AKLV217-5-MXK-DIAOPAI-3.jpg",
+        "AKLV217-5-MXK-MODEL-1(PNG).jpg",
+        "AKLV217-5-MXK-SELL-1.jpg",
+        "AKLV217-5-MXK-SELL-2.jpg",
+        "AKLV217-5-MXK-SELL-3.jpg",
+        "AKLV217-5-MXK-SELL-4.jpg",
+        "AKLV217-5-MXK-SHUIXIBIAO-1.jpg",
+        "AKLV217-5-MXK-WHITE-1.jpg",
+        "AKLV217-5-MXK-WHITE-10.jpg",
+        "AKLV217-5-MXK-WHITE-11.jpg",
+        "AKLV217-5-MXK-WHITE-14.jpg",
+        "AKLV217-5-MXK-WHITE-15.jpg",
+        "AKLV217-5-MXK-WHITE-16(800).jpg",
+        "AKLV217-5-MXK-WHITE-16(G800).jpg",
+        "AKLV217-5-MXK-WHITE-2.jpg",
+        "AKLV217-5-MXK-WHITE-3.jpg",
+        "AKLV217-5-MXK-WHITE-4.jpg",
+        "AKLV217-5-MXK-WHITE-5.jpg",
+        "AKLV217-5-MXK-WHITE-6.jpg",
+        "AKLV217-5-MXK-WHITE-7.jpg",
+        "AKLV217-5-MXK-WHITE-8.jpg",
+        "AKLV217-5-MXK-WHITE-9.jpg",
+        "AKLV217-5-SIZE.jpg",
+    ]
+    ln_items = [
+        LabelResult(
+            brand="LN", 
+            pic_id=idx, 
+            type="其他", 
+            size=100, 
+            confidence=0.9, 
+            pic_name=fname, 
+            product_code="AKLV217-5-MXK"
+        )
+        for idx, fname in enumerate(ln_filenames, start=1)
+    ]
+    ln_result = service.select_images(ln_items)
+    ln_json = []
+    for record in ln_result:
+        item = record['item']
+        ln_json.append({
+            'pic_name': item.pic_name,
+            'rule': record['rule'],
+            'new_file_name': record['new_file_name']
+        })
+    print(json.dumps(ln_json, indent=2, ensure_ascii=False))

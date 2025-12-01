@@ -61,7 +61,7 @@ class PredictionRequest(BaseModel):
     return_top_k: int = 3
 
 
-class PredictionResult(BaseModel):
+class PredictionItem(BaseModel):
     """单个预测结果"""
     class_name: str
     confidence: float
@@ -69,9 +69,18 @@ class PredictionResult(BaseModel):
 
 
 class PredictionResponse(BaseModel):
-    """预测响应模型"""
+    """预测响应模型 - 裤子分类专用"""
     class_name: str
     confidence: float
+
+
+class ClothesClassificationResponse(BaseModel):
+    """衣服分类响应模型"""
+    success: bool
+    message: str
+    predictions: List[PredictionItem]
+    processing_time: float
+    model_info: Dict[str, Any]
 
 
 class ModelInfo(BaseModel):
@@ -321,7 +330,7 @@ def predict_image_tensor(image_tensor: torch.Tensor, top_k: int = 3):
                 prob = top_probs[i].item()
                 class_name = class_names[class_idx]
                 
-                results.append(PredictionResult(
+                results.append(PredictionItem(
                     class_name=class_name,
                     confidence=prob,
                     probability=prob
@@ -419,7 +428,7 @@ async def get_model_info():
     )
 
 
-@app.post("/predict/upload", response_model=PredictionResponse)
+@app.post("/predict/upload", response_model=ClothesClassificationResponse)
 async def predict_upload(
     file: UploadFile = File(...),
     top_k: int = 3
@@ -446,7 +455,7 @@ async def predict_upload(
         
         processing_time = time.time() - start_time_pred
         
-        return PredictionResponse(
+        return ClothesClassificationResponse(
             success=True,
             message="预测成功",
             predictions=predictions,
@@ -462,7 +471,7 @@ async def predict_upload(
         raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
 
 
-@app.post("/predict/base64", response_model=PredictionResponse)
+@app.post("/predict/base64", response_model=ClothesClassificationResponse)
 async def predict_base64(request: PredictionRequest):
     """通过base64编码的图片进行预测"""
     if model is None:
@@ -489,7 +498,7 @@ async def predict_base64(request: PredictionRequest):
         
         processing_time = time.time() - start_time_pred
         
-        return PredictionResponse(
+        return ClothesClassificationResponse(
             success=True,
             message="预测成功",
             predictions=predictions,
