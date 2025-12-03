@@ -1,8 +1,12 @@
 """Pants labeling service with brand-specific selection rules."""
 import json
+import logging
 import re
 from typing import List, Dict, Any, Optional, Set, Tuple
+
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, model_validator
 
@@ -58,7 +62,7 @@ class LabeledImage(BaseModel):
 class LabelingResponse(BaseModel):
     selected: List[LabeledImage]
 
-
+# 品牌类型到编号的映射
 pants_type_to_code = {
     "正面模特": "01-model",
     "正面平铺": "01",
@@ -99,92 +103,169 @@ class PantsLabelingService:
         # 为每个item填充type_code
         self._assign_type_codes(ordered)
         self._assign_new_file_names(brand, ordered)
+        logger.info(f"选图结果: {ordered}")
         return ordered
 
     def _select_ad_brand_images(self, items: List[LabelResult]) -> List[Dict[str, Any]]:
-        """AD品牌选图:
-        1. 正面模特 -> 01 (01-model)
-        2. 正面平铺 -> 02 (01)
-        3. 背面模特 -> 03 (02-model)
-        4. 其他细节 -> 04, 05 (口袋/裤脚/腰部/商标特写等)
-        5. 全身模特 -> 06 (01-model-all)
+        """AD品牌选图：按优先级依次选取图片完成01-06的选图
+        
+        优先级顺序（从高到低）：
+        1. 正面模特
+        2. 正面平铺
+        3. 背面模特
+        4. 背面平铺
+        5. 其他细节（不含全身模特）
+        6. 全身模特（06位置优先使用）
+        
+        选图逻辑：
+        - 01-05按优先级从高到低选取
+        - 06位置优先使用全身模特，没有则用其他图片补充
+        - 同类型内按置信度降序选择
         """
+        # 过滤掉pic_name中包含"详情图"的图片
+        original_count = len(items)
+        filtered_items = [item for item in items if "详情图" not in item.pic_name]
+        filtered_count = original_count - len(filtered_items)
+        if filtered_count > 0:
+            logger.info(f"AD品牌选图: 过滤掉{filtered_count}张详情图，剩余{len(filtered_items)}张")
+        items = filtered_items
+        
+        # 定义类型优先级（数字越小优先级越高）
+        type_priority_order = ["正面模特", "正面平铺", "背面模特", "背面平铺"]
+        
+        # 按类型分组，每组按置信度降序排列
         grouped = self._group_by_type(items)
-        used_ids: Set[int] = set()
+        
         ordered: List[Dict[str, Any]] = []
-
-        def append_item(candidate: Optional[LabelResult], rule_desc: str):
-            if candidate:
-                ordered.append({"item": candidate, "rule": rule_desc})
-
-        # 位置1: 正面模特
-        append_item(self._pick_best_of_type(grouped, "正面模特", used_ids), "AD规则1: 正面模特")
+        used_ids: Set[int] = set()
+        backup_pool: List[LabelResult] = []  # 备选池：同类型的其他图片
         
-        # 位置2: 正面平铺
-        append_item(self._pick_best_of_type(grouped, "正面平铺", used_ids), "AD规则2: 正面平铺")
+        # 第一轮：按优先级每种类型选一张置信度最高的
+        for target_type in type_priority_order:
+            if target_type in grouped:
+                type_items = grouped[target_type]
+                if type_items:
+                    best = type_items[0]
+                    if best.pic_id not in used_ids:
+                        ordered.append({"item": best, "rule": f"AD规则: {target_type}"})
+                        used_ids.add(best.pic_id)
+                    # 剩余的放入备选池
+                    for item in type_items[1:]:
+                        if item.pic_id not in used_ids:
+                            backup_pool.append(item)
         
-        # 位置3: 背面模特
-        append_item(self._pick_best_of_type(grouped, "背面模特", used_ids), "AD规则3: 背面模特")
-
-        # 位置4-5: 其他细节（排除全身模特）
-        pool = [item for item in items if item.pic_id not in used_ids]
-        detail_candidates = self._pick_from_pool(pool, used_ids, limit=2, exclude_types={"全身模特"})
-        for candidate in detail_candidates:
-            ordered.append({"item": candidate, "rule": "AD规则4: 其他细节"})
+        # 第二轮：其他细节类型（不含全身模特，为06预留）
+        for item_type, type_items in grouped.items():
+            if item_type not in type_priority_order and item_type != "全身模特":
+                for item in type_items:
+                    if item.pic_id not in used_ids:
+                        if len(ordered) < self.MAX_SELECTION - 1:  # 预留一个位置给全身模特
+                            ordered.append({"item": item, "rule": "AD规则: 其他细节"})
+                            used_ids.add(item.pic_id)
+                        else:
+                            backup_pool.append(item)
         
-        # 位置6: 优先全身模特，如果没有则用其他细节补充
-        full_body = self._pick_best_of_type(grouped, "全身模特", used_ids)
-        if full_body:
-            ordered.append({"item": full_body, "rule": "AD规则5: 全身模特"})
-        else:
-            # 如果没有全身模特，从剩余图片中选一张
-            remaining_pool = [item for item in items if item.pic_id not in used_ids]
-            fallback = self._pick_from_pool(remaining_pool, used_ids, limit=1)
-            if fallback:
-                ordered.append({"item": fallback[0], "rule": "AD规则6: 其他细节补充"})
-
-        self._fill_remaining(items, used_ids, ordered)
+        # 第三轮：06位置优先使用全身模特
+        if len(ordered) < self.MAX_SELECTION and "全身模特" in grouped:
+            full_body_items = grouped["全身模特"]
+            for item in full_body_items:
+                if item.pic_id not in used_ids:
+                    ordered.append({"item": item, "rule": "AD规则: 全身模特(06)"})
+                    used_ids.add(item.pic_id)
+                    break  # 只选一张全身模特
+        
+        # 第四轮：如果还不够6张，从备选池按置信度降序补充
+        if len(ordered) < self.MAX_SELECTION:
+            backup_pool.sort(key=lambda x: (x.confidence, x.size), reverse=True)
+            for item in backup_pool:
+                if item.pic_id not in used_ids:
+                    ordered.append({"item": item, "rule": "AD规则: 备选补充"})
+                    used_ids.add(item.pic_id)
+                    if len(ordered) >= self.MAX_SELECTION:
+                        break
+        
+        logger.info(f"AD品牌选图: {ordered}")
         return ordered
 
     def _select_nk_brand_images(self, items: List[LabelResult]) -> List[Dict[str, Any]]:
-        """NK品牌选图:
-        1. 正面模特 -> 01 (01-model)
-        2. 背面模特 -> 02 (02-model)
-        3. 其他细节 -> 03, 04, 05 (口袋/裤脚/腰部/商标特写等)
-        4. 全身模特 -> 06 (01-model-all)
+        """NK品牌选图：按优先级依次选取图片完成01-06的选图
+        
+        优先级顺序（从高到低）：
+        1. 正面模特
+        2. 正面平铺
+        3. 背面模特
+        4. 背面平铺
+        5. 其他细节（不含全身模特）
+        6. 全身模特（06位置优先使用）
+        
+        选图逻辑：
+        - 01-05按优先级从高到低选取
+        - 06位置优先使用全身模特，没有则用其他图片补充
+        - 同类型内按置信度降序选择
         """
+        # 过滤掉pic_name中包含"详情图"的图片
+        original_count = len(items)
+        filtered_items = [item for item in items if "详情图" not in item.pic_name]
+        filtered_count = original_count - len(filtered_items)
+        if filtered_count > 0:
+            logger.info(f"NK品牌选图: 过滤掉{filtered_count}张详情图，剩余{len(filtered_items)}张")
+        items = filtered_items
+        
+        # 定义类型优先级
+        type_priority_order = ["正面模特", "正面平铺", "背面模特", "背面平铺"]
+        
+        # 按类型分组，每组按置信度降序排列
         grouped = self._group_by_type(items)
-        used_ids: Set[int] = set()
+        
         ordered: List[Dict[str, Any]] = []
-
-        def append_item(candidate: Optional[LabelResult], rule_desc: str):
-            if candidate:
-                ordered.append({"item": candidate, "rule": rule_desc})
-
-        # 位置1: 正面模特
-        append_item(self._pick_best_of_type(grouped, "正面模特", used_ids), "NK规则1: 正面模特")
+        used_ids: Set[int] = set()
+        backup_pool: List[LabelResult] = []  # 备选池：同类型的其他图片
         
-        # 位置2: 背面模特
-        append_item(self._pick_best_of_type(grouped, "背面模特", used_ids), "NK规则2: 背面模特")
-
-        # 位置3-5: 其他细节（排除全身模特）
-        pool = [item for item in items if item.pic_id not in used_ids]
-        detail_candidates = self._pick_from_pool(pool, used_ids, limit=3, exclude_types={"全身模特"})
-        for candidate in detail_candidates:
-            ordered.append({"item": candidate, "rule": "NK规则3: 其他细节"})
+        # 第一轮：按优先级每种类型选一张置信度最高的
+        for target_type in type_priority_order:
+            if target_type in grouped:
+                type_items = grouped[target_type]
+                if type_items:
+                    best = type_items[0]
+                    if best.pic_id not in used_ids:
+                        ordered.append({"item": best, "rule": f"NK规则: {target_type}"})
+                        used_ids.add(best.pic_id)
+                    # 剩余的放入备选池
+                    for item in type_items[1:]:
+                        if item.pic_id not in used_ids:
+                            backup_pool.append(item)
         
-        # 位置6: 优先全身模特，如果没有则用其他细节补充
-        full_body = self._pick_best_of_type(grouped, "全身模特", used_ids)
-        if full_body:
-            ordered.append({"item": full_body, "rule": "NK规则4: 全身模特"})
-        else:
-            # 如果没有全身模特，从剩余图片中选一张
-            remaining_pool = [item for item in items if item.pic_id not in used_ids]
-            fallback = self._pick_from_pool(remaining_pool, used_ids, limit=1)
-            if fallback:
-                ordered.append({"item": fallback[0], "rule": "NK规则5: 其他细节补充"})
-
-        self._fill_remaining(items, used_ids, ordered)
+        # 第二轮：其他细节类型（不含全身模特，为06预留）
+        for item_type, type_items in grouped.items():
+            if item_type not in type_priority_order and item_type != "全身模特":
+                for item in type_items:
+                    if item.pic_id not in used_ids:
+                        if len(ordered) < self.MAX_SELECTION - 1:  # 预留一个位置给全身模特
+                            ordered.append({"item": item, "rule": "NK规则: 其他细节"})
+                            used_ids.add(item.pic_id)
+                        else:
+                            backup_pool.append(item)
+        
+        # 第三轮：06位置优先使用全身模特
+        if len(ordered) < self.MAX_SELECTION and "全身模特" in grouped:
+            full_body_items = grouped["全身模特"]
+            for item in full_body_items:
+                if item.pic_id not in used_ids:
+                    ordered.append({"item": item, "rule": "NK规则: 全身模特(06)"})
+                    used_ids.add(item.pic_id)
+                    break  # 只选一张全身模特
+        
+        # 第四轮：如果还不够6张，从备选池按置信度降序补充
+        if len(ordered) < self.MAX_SELECTION:
+            backup_pool.sort(key=lambda x: (x.confidence, x.size), reverse=True)
+            for item in backup_pool:
+                if item.pic_id not in used_ids:
+                    ordered.append({"item": item, "rule": "NK规则: 备选补充"})
+                    used_ids.add(item.pic_id)
+                    if len(ordered) >= self.MAX_SELECTION:
+                        break
+        
+        logger.info(f"NK品牌选图: {ordered}")
         return ordered
 
     def _select_ln_brand_images(self, items: List[LabelResult]) -> List[Dict[str, Any]]:
@@ -236,7 +317,17 @@ class PantsLabelingService:
         return value.strip() if isinstance(value, str) else value
     
     def _assign_type_codes(self, ordered: List[Dict[str, Any]]) -> None:
-        """根据pants_type_to_code映射为每个item填充type_code字段"""
+        """根据pants_type_to_code映射为每个item填充type_code字段
+        
+        Args:
+            ordered: 已排序的打标记录列表，每个记录包含item和rule
+            
+        功能：
+        - 遍历所有选中的图片
+        - 根据图片类型查找对应的type_code编码
+        - 将编码赋值给LabelResult对象的type_code字段
+        - 如果类型没有对应编码，则保持为None
+        """
         for record in ordered:
             item = record["item"]
             item_type = self._normalize_text(item.type)
@@ -244,25 +335,61 @@ class PantsLabelingService:
             item.type_code = pants_type_to_code.get(item_type)
 
     def _group_by_type(self, items: List[LabelResult]) -> Dict[str, List[LabelResult]]:
+        """将图片按类型分组，并按置信度降序排列
+        
+        Args:
+            items: 待分组的图片列表
+            
+        Returns:
+            Dict[str, List[LabelResult]]: 按类型分组的字典，
+                                         key为类型名称，value为该类型图片列表
+                                         
+        功能：
+        - 按图片类型分组（如"正面平铺"、"背面平铺"等）
+        - 每组内按置信度降序排列（优先选择分类置信度高的图片）
+        - 置信度相同时按尺寸降序排列
+        - 便于后续按类型选择最优图片
+        """
         grouped: Dict[str, List[LabelResult]] = {}
         for item in items:
             item_type = self._normalize_text(item.type)
             grouped.setdefault(item_type, []).append(item)
         for item_type in grouped:
-            grouped[item_type].sort(key=lambda x: x.size, reverse=True)
+            # 先按置信度降序，置信度相同时按尺寸降序
+            grouped[item_type].sort(key=lambda x: (x.confidence, x.size), reverse=True)
         return grouped
 
     def _pick_best_of_type(
         self, grouped: Dict[str, List[LabelResult]], target_type: str, used_ids: Set[int]
     ) -> Optional[LabelResult]:
+        """
+        从指定类型的图片中选择最优的一张
+        
+        Args:
+            grouped: 按类型分组的图片字典 {type: [LabelResult, ...]}
+            target_type: 目标类型名称（如"正面平铺"、"背面模特"等）
+            used_ids: 已使用的图片ID集合，用于去重
+            
+        Returns:
+            LabelResult: 选中的最优图片（按尺寸降序排列的第一个未被使用的）
+            None: 如果该类型不存在或所有图片都已被使用
+        """
+        # 获取指定类型的图片列表
         target_list = grouped.get(target_type)
         if not target_list:
             return None
+        
+        # 遍历该类型的图片列表（已按尺寸降序排列）
         for candidate in target_list:
+            # 跳过已被使用的图片
             if candidate.pic_id in used_ids:
                 continue
+            
+            # 标记为已使用并返回该图片
             used_ids.add(candidate.pic_id)
             return candidate
+        
+        # 所有图片都已被使用，返回None
         return None
 
     def _pick_from_pool(
@@ -272,6 +399,23 @@ class PantsLabelingService:
         limit: int,
         exclude_types: Optional[Set[str]] = None,
     ) -> List[LabelResult]:
+        """从图片池中选择指定数量的图片
+        
+        Args:
+            pool: 候选图片池（未分组的图片列表）
+            used_ids: 已使用的图片ID集合
+            limit: 需要选择的图片数量限制
+            exclude_types: 需要排除的图片类型集合
+            
+        Returns:
+            List[LabelResult]: 选中的图片列表
+            
+        功能：
+        - 按尺寸降序遍历候选图片
+        - 跳过已使用和排除类型的图片
+        - 最多选择limit张图片
+        - 自动标记已使用的pic_id
+        """
         exclude_types = {self._normalize_text(t) for t in (exclude_types or set())}
         selected: List[LabelResult] = []
         for candidate in sorted(pool, key=lambda x: x.size, reverse=True):
@@ -299,7 +443,18 @@ class PantsLabelingService:
             ordered.append({"item": candidate, "rule": "规则6: 兜底选择"})
 
     def _assign_new_file_names(self, brand: str, ordered: List[Dict[str, Any]]) -> None:
-        """按照品牌规则，为每条记录分配 brand_XX 的导出文件名。"""
+        """按照品牌规则，为每条记录分配 brand_XX 的导出文件名
+        
+        Args:
+            brand: 品牌名称（如"AD"、"NK"）
+            ordered: 已排序的打标记录列表
+            
+        功能：
+        - 根据品牌选择对应的文件名分配策略
+        - AD品牌：按优先级排序后依次分配01-06
+        - NK品牌：按特定规则分配编号
+        - 其他品牌：按顺序分配01-06
+        """
         brand_code = brand.upper()
         if brand_code == "AD":
             self._assign_ad_filenames(brand_code, ordered)
@@ -309,54 +464,32 @@ class PantsLabelingService:
             self._assign_sequential_filenames(brand_code, ordered)
 
     def _assign_ad_filenames(self, brand: str, ordered: List[Dict[str, Any]]) -> None:
-        """AD品牌文件名：01正面模特、02正面平铺、03背面模特、04-05为其他、06兜底。"""
-        front_assigned = False
-        flat_assigned = False
-        back_assigned = False
-        other_codes = iter(["04", "05"])
-        for record in ordered:
-            item_type = self._normalize_text(record["item"].type)
-            code = None
-
-            if not front_assigned and item_type == "正面模特":
-                code = "01"
-                front_assigned = True
-            elif not flat_assigned and item_type == "正面平铺":
-                code = "02"
-                flat_assigned = True
-            elif not back_assigned and item_type == "背面模特":
-                code = "03"
-                back_assigned = True
-            elif item_type != "全身模特":
-                code = next(other_codes, None)
-
-            if code is None:
-                code = "06"
-
-            record["new_file_name"] = self._compose_new_file_path(record["item"].pic_name, str(record["item"].product_code), code)
+        """AD品牌文件名：按已排序的顺序依次分配01-06
+        
+        注意：ordered列表已在_select_ad_brand_images中按优先级排好序，
+              此处直接按顺序分配编号即可
+        """
+        for idx, record in enumerate(ordered):
+            code = f"{idx + 1:02d}" if idx < 6 else "06"
+            record["new_file_name"] = self._compose_new_file_path(
+                record["item"].pic_name, 
+                str(record["item"].product_code), 
+                code
+            )
 
     def _assign_nk_filenames(self, brand: str, ordered: List[Dict[str, Any]]) -> None:
-        """NK品牌文件名：01正面模特、02背面模特、03-05其他（排除全身）、06兜底。"""
-        front_assigned = False
-        back_assigned = False
-        other_codes = iter(["03", "04", "05"])
-        for record in ordered:
-            item_type = self._normalize_text(record["item"].type)
-            code = None
-
-            if not front_assigned and item_type == "正面模特":
-                code = "01"
-                front_assigned = True
-            elif not back_assigned and item_type == "背面模特":
-                code = "02"
-                back_assigned = True
-            elif item_type != "全身模特":
-                code = next(other_codes, None)
-
-            if code is None:
-                code = "06"
-
-            record["new_file_name"] = self._compose_new_file_path(record["item"].pic_name, str(record["item"].product_code), code)
+        """NK品牌文件名：按已排序的顺序依次分配01-06
+        
+        注意：ordered列表已在_select_nk_brand_images中按优先级排好序，
+              此处直接按顺序分配编号即可
+        """
+        for idx, record in enumerate(ordered):
+            code = f"{idx + 1:02d}" if idx < 6 else "06"
+            record["new_file_name"] = self._compose_new_file_path(
+                record["item"].pic_name, 
+                str(record["item"].product_code), 
+                code
+            )
 
     def _assign_sequential_filenames(self, brand: str, ordered: List[Dict[str, Any]]) -> None:
         """默认文件名：brand_01 ~ brand_06 顺序编号。"""
@@ -374,128 +507,3 @@ class PantsLabelingService:
             return str(path.with_name(new_name))
         except Exception:
             return f"{product_code}_{code}"
-
-if __name__ == "__main__":
-    service = PantsLabelingService()
-    # 测试NK品牌选图
-    print("=" * 60)
-    print("测试NK品牌选图")
-    print("=" * 60)
-    nk_items = [
-        LabelResult(brand="NK", pic_id=1, type="正面模特", size=100, confidence=0.9, pic_name="front_model.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=2, type="背面模特", size=100, confidence=0.9, pic_name="back_model.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=3, type="全身模特", size=100, confidence=0.9, pic_name="full_body.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=4, type="口袋特写", size=100, confidence=0.9, pic_name="pocket.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=5, type="裤脚特写", size=100, confidence=0.9, pic_name="crotch.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=6, type="腰部特写", size=100, confidence=0.9, pic_name="waist.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=7, type="商标特写", size=100, confidence=0.9, pic_name="logo.jpg", product_code="12345"),
-        LabelResult(brand="NK", pic_id=8, type="其他细节", size=100, confidence=0.9, pic_name="other.jpg", product_code="12345"),
-    ]
-    nk_result = service.select_images(nk_items)
-    # 转换为可JSON序列化的格式
-    nk_json = []
-    for record in nk_result:
-        item = record['item']
-        nk_json.append({
-            'type': item.type,
-            'type_code': item.type_code,
-            'product_code': item.product_code,
-            'pic_id': item.pic_id,
-            'pic_name': item.pic_name,
-            'size': item.size,
-            'confidence': item.confidence,
-            'rule': record['rule'],
-            'new_file_name': record['new_file_name']
-        })
-    print(json.dumps(nk_json, indent=2, ensure_ascii=False))  
-    # for idx, record in enumerate(nk_result, 1):
-    #     item = record['item']
-    #     print(f"{idx}. {item.type} (type_code: {item.type_code}) - {record['rule']} - {record['new_file_name']}")
-    
-    print("\n" + "=" * 60)
-    print("测试AD品牌选图")
-    print("=" * 60)
-    ad_items = [
-        LabelResult(brand="AD", pic_id=1, type="正面模特", size=100, confidence=0.9, pic_name="front_model.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=2, type="正面平铺", size=100, confidence=0.9, pic_name="front_flat.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=3, type="背面模特", size=100, confidence=0.9, pic_name="back_model.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=4, type="全身模特", size=100, confidence=0.9, pic_name="full_body.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=5, type="口袋特写", size=100, confidence=0.9, pic_name="pocket.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=6, type="裤脚特写", size=100, confidence=0.9, pic_name="crotch.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=7, type="腰部特写", size=100, confidence=0.9, pic_name="waist.jpg", product_code="67890"),
-        LabelResult(brand="AD", pic_id=8, type="商标特写", size=100, confidence=0.9, pic_name="logo.jpg", product_code="67890"),
-    ]
-    ad_result = service.select_images(ad_items)
-    # 转换为可JSON序列化的格式
-    ad_json = []
-    for record in ad_result:
-        item = record['item']
-        ad_json.append({
-            'type': item.type,
-            'type_code': item.type_code,
-            'product_code': item.product_code,
-            'pic_id': item.pic_id,
-            'pic_name': item.pic_name,
-            'size': item.size,
-            'confidence': item.confidence,
-            'rule': record['rule'],
-            'new_file_name': record['new_file_name']
-        })
-    print(json.dumps(ad_json, indent=2, ensure_ascii=False))
-    # for idx, record in enumerate(ad_result, 1):
-    #     item = record['item']
-    #     print(f"{idx}. {item.type} (type_code: {item.type_code}) - {record['rule']} - {record['new_file_name']}")
-
-    print("\n" + "=" * 60)
-    print("测试LN品牌选图 - WHITE文件名过滤")
-    print("=" * 60)
-    # 使用真实示例文件名
-    ln_filenames = [
-        "AKLV217-5-MXK-DIAOPAI-1.jpg",
-        "AKLV217-5-MXK-DIAOPAI-2.jpg",
-        "AKLV217-5-MXK-DIAOPAI-3.jpg",
-        "AKLV217-5-MXK-MODEL-1(PNG).jpg",
-        "AKLV217-5-MXK-SELL-1.jpg",
-        "AKLV217-5-MXK-SELL-2.jpg",
-        "AKLV217-5-MXK-SELL-3.jpg",
-        "AKLV217-5-MXK-SELL-4.jpg",
-        "AKLV217-5-MXK-SHUIXIBIAO-1.jpg",
-        "AKLV217-5-MXK-WHITE-1.jpg",
-        "AKLV217-5-MXK-WHITE-10.jpg",
-        "AKLV217-5-MXK-WHITE-11.jpg",
-        "AKLV217-5-MXK-WHITE-14.jpg",
-        "AKLV217-5-MXK-WHITE-15.jpg",
-        "AKLV217-5-MXK-WHITE-16(800).jpg",
-        "AKLV217-5-MXK-WHITE-16(G800).jpg",
-        "AKLV217-5-MXK-WHITE-2.jpg",
-        "AKLV217-5-MXK-WHITE-3.jpg",
-        "AKLV217-5-MXK-WHITE-4.jpg",
-        "AKLV217-5-MXK-WHITE-5.jpg",
-        "AKLV217-5-MXK-WHITE-6.jpg",
-        "AKLV217-5-MXK-WHITE-7.jpg",
-        "AKLV217-5-MXK-WHITE-8.jpg",
-        "AKLV217-5-MXK-WHITE-9.jpg",
-        "AKLV217-5-SIZE.jpg",
-    ]
-    ln_items = [
-        LabelResult(
-            brand="LN", 
-            pic_id=idx, 
-            type="其他", 
-            size=100, 
-            confidence=0.9, 
-            pic_name=fname, 
-            product_code="AKLV217-5-MXK"
-        )
-        for idx, fname in enumerate(ln_filenames, start=1)
-    ]
-    ln_result = service.select_images(ln_items)
-    ln_json = []
-    for record in ln_result:
-        item = record['item']
-        ln_json.append({
-            'pic_name': item.pic_name,
-            'rule': record['rule'],
-            'new_file_name': record['new_file_name']
-        })
-    print(json.dumps(ln_json, indent=2, ensure_ascii=False))

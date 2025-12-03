@@ -155,6 +155,16 @@ class PantsWorkflowService:
             if not pic_list:
                 raise ValueError("图片列表为空")
             
+            # 1.5 过滤掉pic_name中包含"详情图"的图片（在分类前过滤，节省计算资源）
+            original_count = len(pic_list)
+            pic_list = [pic for pic in pic_list if "详情图" not in pic.get("pic_name", "")]
+            filtered_count = original_count - len(pic_list)
+            if filtered_count > 0:
+                logger.info(f"品牌{brand}, 货号{product_code}, 过滤掉{filtered_count}张详情图，剩余{len(pic_list)}张待分类")
+            
+            if not pic_list:
+                raise ValueError("过滤详情图后图片列表为空")
+            
             # 2. 批量分类图片
             logger.info(f"品牌{brand}, 货号{product_code}, 开始批量分类{len(pic_list)}张图片")
             classification_results = self.classify_images(pic_list, predict_func)
@@ -325,8 +335,8 @@ class PantsWorkflowService:
                 "tag_second_type": "11",
                 "tag_result": None,
                 "pic_id": pic_id,
-                "type": seq,
-                "type_code": seq,
+                "type": f"{seq:02d}",
+                "type_code": f"{seq:02d}",
                 "size": 0,
                 "confidence": 1.0,
                 "pic_name": pic_name,
