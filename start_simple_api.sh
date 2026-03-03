@@ -4,7 +4,8 @@
 set -euo pipefail
 
 PROJECT_DIR="/data/hx/model-train"
-ENV_PATH="/root/.conda/envs/model-train"
+ENV_PATH="/data/miniforge3/envs/model-train-mf"
+BACK_ENV_PATH="/root/.conda/envs/model-train"
 PYTHON_BIN="$ENV_PATH/bin/python"
 LOG_FILE="$PROJECT_DIR/simple_api.log"
 PID_FILE="$PROJECT_DIR/simple_api.pid"

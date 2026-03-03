@@ -44,16 +44,12 @@ class LabelingRequest(BaseModel):
 
 class LabeledImage(BaseModel):
     product_code: str
+    code: str
     tag_first_type: str
     tag_second_type: str
     tag_result: Optional[str] = None
     pic_id: int
-    type: str
-    type_code: Optional[str] = None
     size: int
-    confidence: float
-    pic_name: str
-    new_file_name: str
     return_content_name: Optional[str] = None
     original_file_name: Optional[str] = None
     return_content_type: str = "原图"

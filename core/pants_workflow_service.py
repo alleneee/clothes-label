@@ -237,19 +237,15 @@ class PantsWorkflowService:
                 
                 result_list.append({
                     "product_code": product_code,
+                    "code": f"货号_{idx + 1:02d}",
                     "tag_first_type": "1",
                     "tag_second_type": "11",
-                    "tag_result": record['item'].type_code,
+                    "tag_result": record['item'].type,
                     "pic_id": record['item'].pic_id,
-                    "type": record['item'].type,
-                    "type_code": record['item'].type_code,
                     "size": record['item'].size,
-                    "confidence": record['item'].confidence,
-                    "pic_name": record['item'].pic_name,  # 保持原始文件名
-                    "new_file_name": new_filename,
                     "return_content_name": renamed_file,
                     "original_file_name": record['item'].pic_name,
-                    "return_content_type": picture_type  # 使用传入的picture_type
+                    "return_content_type": "原图"
                 })
             
             logger.info(f"品牌{brand}, 货号{product_code}, 完整流程处理完成，返回{len(result_list)}个结果")
@@ -331,19 +327,15 @@ class PantsWorkflowService:
             
             result_list.append({
                 "product_code": product_code,
+                "code": f"货号_{seq:02d}",
                 "tag_first_type": "1",
                 "tag_second_type": "11",
                 "tag_result": None,
                 "pic_id": pic_id,
-                "type": f"{seq:02d}",
-                "type_code": f"{seq:02d}",
                 "size": 0,
-                "confidence": 1.0,
-                "pic_name": pic_name,
-                "new_file_name": new_filename,
                 "return_content_name": renamed_file,
                 "original_file_name": pic_name,
-                "return_content_type": picture_type
+                "return_content_type": "原图"
             })
         
         logger.info(f"品牌LN, 货号{product_code}, 完整流程处理完成，返回{len(result_list)}个结果")
@@ -378,6 +370,10 @@ class PantsWorkflowService:
         Returns:
             新的文件路径
         """
+        # 统一将 .jpeg 后缀转换为 .jpg（与 OSS rename 接口保持一致）
+        if new_file_name.lower().endswith('.jpeg'):
+            new_file_name = new_file_name[:-5] + '.jpg'
+        
         # 获取当前时间的年/月/日
         today = datetime.today()
         year = today.strftime("%Y")

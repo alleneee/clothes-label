@@ -1,0 +1,32 @@
+name: model-train-mf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - torch==2.2.2
+    - torchvision==0.17.2
+    - pytorch-lightning==2.2.5
+    - timm==1.0.22
+    - albumentations
+    - datasets
+    - huggingface-hub
+    - modelscope
+    - fastapi
+    - uvicorn
+    - gunicorn
+    - numpy==1.26.4
+    - pandas
+    - scikit-learn
+    - matplotlib
+    - seaborn
+    - opencv-python-headless
+    - pillow
+    - pyyaml
+    - tqdm
+    - tensorboard
+    - safetensors
+    - httpx
+    - python-dotenv
+    - python-multipart
