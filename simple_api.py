@@ -38,6 +38,15 @@ from core.pants_labeling_service import (
     PantsLabelingService
 )
 from core.pants_workflow_service import PantsWorkflowService
+from core.clip import (
+    QwenVLDetector,
+    LabelCropper,
+    LabelGrouper,
+    LabelStitcher,
+    LabelPipeline,
+    LabelType,
+    DetectedLabel,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +62,9 @@ transform = None
 # 全局变量 - 裤子模型
 pants_labeling_service = PantsLabelingService()
 pants_workflow_service = PantsWorkflowService(labeling_service=pants_labeling_service)
+
+# 全局变量 - 标签检测裁剪
+label_pipeline = None
 
 
 class PredictionRequest(BaseModel):
@@ -106,6 +118,31 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     device: str
     uptime: float
+
+
+class LabelDetectionItem(BaseModel):
+    """单个标签检测结果"""
+    label_type: str
+    bbox: List[int]
+    source_image: str
+
+
+class LabelDetectionResponse(BaseModel):
+    """标签检测响应"""
+    success: bool
+    message: str
+    detected_labels: Dict[str, List[LabelDetectionItem]]
+    total_count: int
+    processing_time: float
+
+
+class LabelStitchResponse(BaseModel):
+    """标签裁剪拼接响应"""
+    success: bool
+    message: str
+    stitched_images: Dict[str, str]  # label_type -> base64 image
+    detected_labels: Dict[str, int]  # label_type -> count
+    processing_time: float
 
 
 # FastAPI应用
@@ -691,19 +728,227 @@ async def predict_pants_base64(request: PredictionRequest):
         raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
 
 
+# ============================================================
+# 标签检测裁剪拼接 API
+# ============================================================
+
+# OSS上传配置
+OSS_UPLOAD_URL = "http://10.125.1.6:8123/oss_upload_pic"
+
+
+def init_label_pipeline():
+    """初始化标签检测管道"""
+    global label_pipeline
+    if label_pipeline is not None:
+        return
+    
+    try:
+        logger.info("🏷️ 初始化标签检测管道...")
+        detector = QwenVLDetector(
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key="sk-ad248075acc34cdb9c896724d301be2b",
+            model="qwen-vl-max"
+        )
+        label_pipeline = LabelPipeline(
+            detector=detector,
+            cropper=LabelCropper(),
+            grouper=LabelGrouper(),
+            stitcher=LabelStitcher(bg_color=(245, 245, 245), padding=20),
+        )
+        logger.info("✅ 标签检测管道初始化完成")
+    except Exception as e:
+        logger.error(f"❌ 标签检测管道初始化失败: {e}")
+
+
+def upload_image_to_oss(image_bytes: bytes, filename: str, folder: str = "label_crop") -> Optional[str]:
+    """
+    上传图片到OSS
+    
+    Args:
+        image_bytes: 图片字节数据
+        filename: 文件名
+        folder: OSS目录
+    
+    Returns:
+        上传成功返回OSS URL，失败返回None
+    """
+    import requests
+    from datetime import datetime
+    
+    try:
+        # 生成OSS路径: folder/年/月/日/filename
+        today = datetime.today()
+        oss_path = f"{folder}/{today.strftime('%Y/%m/%d')}/{filename}"
+        
+        # 上传到OSS
+        response = requests.post(
+            OSS_UPLOAD_URL,
+            files={"file": (filename, image_bytes, "image/jpeg")},
+            data={"path": oss_path},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            oss_url = result.get("url") or result.get("oss_url") or oss_path
+            logger.info(f"上传成功: {filename} -> {oss_url}")
+            return oss_url
+        else:
+            logger.error(f"上传失败: {filename}, status={response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"上传异常: {filename}, error={e}")
+        return None
+
+
+class LabelProcessRequest(BaseModel):
+    """标签处理请求"""
+    brand: str = ""
+    product_code: str = ""
+    upload_to_oss: bool = True
+
+
+class LabelProcessResponse(BaseModel):
+    """标签处理响应"""
+    success: bool
+    message: str
+    detected_labels: Dict[str, int]
+    stitched_results: List[Dict[str, Any]]
+    processing_time: float
+
+
+@app.post("/label/process", response_model=LabelProcessResponse)
+async def process_labels(
+    files: List[UploadFile] = File(...),
+    brand: str = "",
+    product_code: str = "",
+    upload_to_oss: bool = True
+):
+    """
+    标签检测裁剪拼接一站式接口
+    
+    功能：
+    1. 检测图片中的标签（吊牌、水洗标、合格证）
+    2. 裁剪并拼接同类型标签
+    3. 上传拼接结果到OSS
+    4. 返回OSS地址
+    
+    参数：
+    - files: 上传的图片文件列表
+    - brand: 品牌（可选，用于OSS路径）
+    - product_code: 货号（可选，用于OSS路径）
+    - upload_to_oss: 是否上传到OSS，默认True
+    """
+    init_label_pipeline()
+    if label_pipeline is None:
+        raise HTTPException(status_code=503, detail="标签检测服务未初始化")
+    
+    start_time_proc = time.time()
+    
+    try:
+        import tempfile
+        import shutil
+        from datetime import datetime
+        
+        temp_dir = Path(tempfile.mkdtemp())
+        output_dir = temp_dir / "output"
+        output_dir.mkdir()
+        image_paths = []
+        
+        # 保存上传的图片到临时目录
+        for file in files:
+            if not file.content_type or not file.content_type.startswith('image/'):
+                continue
+            content = await file.read()
+            temp_path = temp_dir / file.filename
+            temp_path.write_bytes(content)
+            image_paths.append(temp_path)
+        
+        if not image_paths:
+            raise HTTPException(status_code=400, detail="未提供有效的图片文件")
+        
+        # 检测并拼接
+        groups = label_pipeline.detect_and_group(image_paths)
+        results = label_pipeline.stitch_groups(groups, output_dir)
+        
+        # 统计各类型数量
+        detected_counts = {lt.value: len(labels) for lt, labels in groups.items()}
+        
+        # 处理结果
+        stitched_results = []
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        for label_type, out_path in results.items():
+            with open(out_path, "rb") as f:
+                image_bytes = f.read()
+            
+            # 生成文件名
+            if product_code:
+                filename = f"{product_code}_{label_type}_{timestamp}.jpg"
+            else:
+                filename = f"{label_type}_{timestamp}.jpg"
+            
+            result_item = {
+                "label_type": label_type,
+                "count": detected_counts.get(label_type, 0),
+                "filename": filename,
+            }
+            
+            if upload_to_oss:
+                # 构建OSS路径
+                folder = "label_crop"
+                if brand:
+                    folder = f"label_crop/{brand}"
+                if product_code:
+                    folder = f"{folder}/{product_code}"
+                
+                oss_url = upload_image_to_oss(image_bytes, filename, folder)
+                result_item["oss_url"] = oss_url
+                result_item["uploaded"] = oss_url is not None
+            else:
+                # 返回base64
+                result_item["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+                result_item["uploaded"] = False
+            
+            stitched_results.append(result_item)
+        
+        # 清理临时文件
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        processing_time = time.time() - start_time_proc
+        
+        return LabelProcessResponse(
+            success=True,
+            message=f"处理完成，检测到 {sum(detected_counts.values())} 个标签，生成 {len(stitched_results)} 张拼接图",
+            detected_labels=detected_counts,
+            stitched_results=stitched_results,
+            processing_time=processing_time
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"标签处理失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"标签处理失败: {str(e)}")
+
+
 if __name__ == "__main__":
     # 启动配置
     host = "0.0.0.0"
     port = 8000
     
     print("=" * 60)
-    print("🚀 启动服饰分类API服务（衣服+裤子）")
+    print("🚀 启动服饰分类API服务（衣服+裤子+标签检测）")
     print("=" * 60)
     print(f"📡 服务地址: http://{host}:{port}")
     print(f"📚 API文档: http://{host}:{port}/docs")
     print(f"🔧 健康检查: http://{host}:{port}/health")
     print(f"👔 衣服分类: http://{host}:{port}/predict/upload")
     print(f"👖 裤子分类: http://{host}:{port}/predict/pants/upload")
+    print(f"🏷️ 标签处理: http://{host}:{port}/label/process")
     print("=" * 60)
     
     # 启动服务
