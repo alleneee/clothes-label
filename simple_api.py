@@ -19,7 +19,7 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import io
@@ -734,6 +734,8 @@ async def predict_pants_base64(request: PredictionRequest):
 
 # OSS上传配置
 OSS_UPLOAD_URL = "http://10.125.1.6:8123/oss_upload_pic"
+LABEL_STITCH_PADDING = 200
+PROJECT_TEMP_DIR = Path(__file__).resolve().parent / "temp"
 
 
 def init_label_pipeline():
@@ -753,7 +755,7 @@ def init_label_pipeline():
             detector=detector,
             cropper=LabelCropper(),
             grouper=LabelGrouper(),
-            stitcher=LabelStitcher(bg_color=(245, 245, 245), padding=20),
+            stitcher=LabelStitcher(bg_color=(245, 245, 245), padding=LABEL_STITCH_PADDING),
         )
         logger.info("✅ 标签检测管道初始化完成")
     except Exception as e:
@@ -821,9 +823,9 @@ class LabelProcessResponse(BaseModel):
 @app.post("/label/process", response_model=LabelProcessResponse)
 async def process_labels(
     files: List[UploadFile] = File(...),
-    brand: str = "",
-    product_code: str = "",
-    upload_to_oss: bool = True
+    product_code: str = Form(""),
+    upload_to_oss: bool = Form(True),
+    type: str = Form("")
 ):
     """
     标签检测裁剪拼接一站式接口
@@ -836,8 +838,8 @@ async def process_labels(
     
     参数：
     - files: 上传的图片文件列表
-    - brand: 品牌（可选，用于OSS路径）
-    - product_code: 货号（可选，用于OSS路径）
+    - product_code: 货号（用于拼接文件名）
+    - type: 处理类型（吊牌处理/水洗标处理）
     - upload_to_oss: 是否上传到OSS，默认True
     """
     init_label_pipeline()
@@ -847,74 +849,126 @@ async def process_labels(
     start_time_proc = time.time()
     
     try:
-        import tempfile
         import shutil
         from datetime import datetime
         
-        temp_dir = Path(tempfile.mkdtemp())
+        request_id = uuid.uuid4().hex
+        temp_dir = PROJECT_TEMP_DIR / request_id
+        input_dir = temp_dir / "input"
         output_dir = temp_dir / "output"
-        output_dir.mkdir()
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
         image_paths = []
         
         # 保存上传的图片到临时目录
-        for file in files:
+        for idx, file in enumerate(files):
             if not file.content_type or not file.content_type.startswith('image/'):
                 continue
             content = await file.read()
-            temp_path = temp_dir / file.filename
+            temp_path = input_dir / f"{idx}_{file.filename}"
             temp_path.write_bytes(content)
             image_paths.append(temp_path)
         
         if not image_paths:
             raise HTTPException(status_code=400, detail="未提供有效的图片文件")
-        
-        # 检测并拼接
-        groups = label_pipeline.detect_and_group(image_paths)
-        results = label_pipeline.stitch_groups(groups, output_dir)
-        
-        # 统计各类型数量
-        detected_counts = {lt.value: len(labels) for lt, labels in groups.items()}
-        
-        # 处理结果
-        stitched_results = []
+        if len(image_paths) != 2:
+            raise HTTPException(status_code=400, detail="当前接口要求每次传入2张同类型图片")
+
+        process_type = (type or "").strip()
+        if process_type == "吊牌处理":
+            suffix = "06"
+            output_label_type = "吊牌"
+        elif process_type == "水洗标处理":
+            suffix = "07"
+            output_label_type = "水洗标"
+        else:
+            raise HTTPException(status_code=400, detail="type 仅支持 吊牌处理 或 水洗标处理")
+
+        def _pick_label(labels):
+            if not labels:
+                return None
+            # 输入已由上游保证类型正确，这里直接取该图最大标签框即可。
+            return max(labels, key=lambda x: x.bbox.width * x.bbox.height)
+
+        # 固定2张图：每张图独立检测并选一个目标框
+        all_labels = []
+        selected_labels = []
+        for idx, path in enumerate(image_paths):
+            grouped = label_pipeline.detect_and_group([path])
+            labels = []
+            for ls in grouped.values():
+                labels.extend(ls)
+            all_labels.extend(labels)
+
+            chosen = _pick_label(labels)
+            if chosen is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"第{idx + 1}张图片未检测到可裁剪标签，请检查图片内容或清晰度"
+                )
+            selected_labels.append(chosen)
+
+        first, second = selected_labels[0], selected_labels[1]
+        selected_label_types = [first.label_type.value, second.label_type.value]
+
+        # 统计检测结果
+        detected_counts = {}
+        for label in all_labels:
+            key = label.label_type.value
+            detected_counts[key] = detected_counts.get(key, 0) + 1
+
+        cropper = LabelCropper()
+        stitcher = LabelStitcher(bg_color=(245, 245, 245), padding=LABEL_STITCH_PADDING)
+        img1 = cropper.crop(first)
+        img2 = cropper.crop(second)
+        stitched = stitcher.stitch(img1, img2)
+
+        out_path = output_dir / f"{output_label_type}_拼接.jpg"
+        stitched.save(out_path, quality=95)
+
+        img1.close()
+        img2.close()
+        stitched.close()
+
+        # 单输出结果（固定2图 -> 固定1张拼接图）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        for label_type, out_path in results.items():
-            with open(out_path, "rb") as f:
-                image_bytes = f.read()
-            
-            # 生成文件名
+
+        with open(out_path, "rb") as f:
+            image_bytes = f.read()
+
+        if product_code:
+            filename = f"{product_code}_{suffix}.jpg"
+        else:
+            filename = f"{output_label_type}_{suffix}_{timestamp}.jpg"
+
+        result_item = {
+            "label_type": output_label_type,
+            "count": 2,
+            "filename": filename,
+            "selected_label_types": selected_label_types,
+        }
+
+        if upload_to_oss:
+            folder = "label_crop"
             if product_code:
-                filename = f"{product_code}_{label_type}_{timestamp}.jpg"
-            else:
-                filename = f"{label_type}_{timestamp}.jpg"
-            
-            result_item = {
-                "label_type": label_type,
-                "count": detected_counts.get(label_type, 0),
-                "filename": filename,
-            }
-            
-            if upload_to_oss:
-                # 构建OSS路径
-                folder = "label_crop"
-                if brand:
-                    folder = f"label_crop/{brand}"
-                if product_code:
-                    folder = f"{folder}/{product_code}"
-                
-                oss_url = upload_image_to_oss(image_bytes, filename, folder)
-                result_item["oss_url"] = oss_url
-                result_item["uploaded"] = oss_url is not None
-            else:
-                # 返回base64
-                result_item["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
-                result_item["uploaded"] = False
-            
-            stitched_results.append(result_item)
+                folder = f"{folder}/{product_code}"
+
+            oss_url = upload_image_to_oss(image_bytes, filename, folder)
+            result_item["oss_url"] = oss_url
+            result_item["uploaded"] = oss_url is not None
+            try:
+                Path(out_path).unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                logger.warning(f"上传后删除本地拼接图失败: {out_path}, error={cleanup_error}")
+        else:
+            result_item["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+            result_item["uploaded"] = False
+
+        stitched_results = [result_item]
         
-        # 清理临时文件
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # 仅在上传OSS后清理本次临时目录；未上传则保留在项目 temp/ 下
+        if upload_to_oss:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         
         processing_time = time.time() - start_time_proc
         
