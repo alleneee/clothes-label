@@ -121,7 +121,7 @@ imbalance:
   sampling:
     method: "balanced_batch"              # 平衡批次采样
     replacement: true
-    oversample_factor: 2.0                # 增加过采样因子
+    oversample_factor: 4.0                # 增加过采样因子（针对标签等少数类别）
     undersample_factor: 0.8               # 适度欠采样
     
   # 损失函数
@@ -188,7 +188,7 @@ checkpointing:
   save_top_k: 2
   save_last: true
   filename: "enhanced-clothes-{epoch:02d}-{val_acc:.3f}"
-  dirpath: "model/checkpoints_enhanced-0910"
+  dirpath: "model/puma-0311"
   
   # 优化保存
   save_weights_only: false
@@ -226,8 +226,8 @@ performance:
 # 类别信息
 classes:
   auto_detect: true
-  names: ['logo', '下摆', '侧面', '其他', '口袋', '正面', '正面全身模特','正面半身模特', '背面', '背面模特', '袖口', '领口','水洗标','合格证']
-  num_classes: 14
+  names: ['logo', '下摆', '侧面', '其他', '口袋', '正面', '正面全身模特','正面半身模特', '背面', '背面模特', '袖口', '领口','水洗标','合格证','标签']
+  num_classes: 15
   
   # 类别权重（基于数据分布自动计算）
   class_weights: "auto"

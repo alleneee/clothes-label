@@ -226,11 +226,22 @@ class PantsWorkflowService:
                 )
                 
                 # 调用OSS重命名接口
+                logger.info(f"品牌{brand}, 货号{product_code}, 开始调用OSS重命名接口: {record['item'].pic_name} -> {new_path}")
+                
                 renamed_file = self.rename_file_in_oss(
+                    brand=brand,
                     old_name=record['item'].pic_name,
                     new_name=new_path
                 )
-                
+
+
+                # 新增 将 renamed_file .png文件后缀替换为.jpg
+                if renamed_file and renamed_file.lower().endswith('.png'):
+                    renamed_file = renamed_file[:-4] + '.jpg'
+                    logger.info(f"品牌{brand}, 货号{product_code}, renamed_file后缀替换为.jpg: {renamed_file}")
+
+                logger.info(f"品牌{brand}, 货号{product_code}, renamed_file: {renamed_file}")
+
                 # 如果重命名成功，记录日志
                 if renamed_file:
                     logger.info(f"品牌{brand}, 货号{product_code}, OSS重命名成功: {record['item'].pic_name} -> {renamed_file}")
@@ -248,7 +259,7 @@ class PantsWorkflowService:
                     "return_content_type": "原图"
                 })
             
-            logger.info(f"品牌{brand}, 货号{product_code}, 完整流程处理完成，返回{len(result_list)}个结果")
+            logger.info(f"品牌{brand}, 货号{product_code}, 裤子完整流程处理完成，结果为: {result_list}")
             return result_list
     
     def _process_ln_brand(
@@ -321,7 +332,7 @@ class PantsWorkflowService:
                 old_name=pic_name,
                 new_name=new_path
             )
-            
+
             if renamed_file:
                 logger.info(f"品牌LN, 货号{product_code}, OSS重命名成功: {pic_name} -> {renamed_file}")
             
@@ -387,6 +398,7 @@ class PantsWorkflowService:
     
     def rename_file_in_oss(
         self,
+        brand: str,
         old_name: str,
         new_name: str,
         name_type: str = "default"
@@ -406,6 +418,7 @@ class PantsWorkflowService:
             response = requests.get(
                 self.oss_rename_url,
                 params={
+                    "brand": brand,
                     "old_name": old_name,
                     "name_type": name_type,
                     "new_name": new_name

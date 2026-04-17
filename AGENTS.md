@@ -12,3 +12,4 @@
 - When asked to analyze code or create documents, produce output incrementally rather than spending extended time on exploration and planning. Deliver a first draft quickly, then iterate.
 - When debugging errors, investigate the actual root cause before applying fixes. Don't take error messages at face value — e.g., 'rate limit' may be a slug conflict, a migration warning may not be the real issue.
 - Break this into 3 phases. After each phase, show me what you have so far before continuing. Phase 1: outline. Phase 2: first draft. Phase 3: polish.
+- use start_simple_api.sh to start the api server

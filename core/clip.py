@@ -183,9 +183,18 @@ class QwenVLDetector(LabelDetector):
 class LabelCropper:
     """从原图中裁剪标签区域"""
 
+    def __init__(self, margin: int = 40):
+        self._margin = margin
+
     def crop(self, label: DetectedLabel) -> Image.Image:
         with Image.open(label.source_image) as img:
-            return img.crop(label.bbox.as_tuple()).copy()
+            img_w, img_h = img.size
+            m = self._margin
+            x1 = max(0, label.bbox.x1 - m)
+            y1 = max(0, label.bbox.y1 - m)
+            x2 = min(img_w, label.bbox.x2 + m)
+            y2 = min(img_h, label.bbox.y2 + m)
+            return img.crop((x1, y1, x2, y2)).copy()
 
 
 # ============================================================
