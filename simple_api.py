@@ -508,6 +508,47 @@ async def predict_upload(
         raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
 
 
+class PredictUploadOssRequest(BaseModel):
+    pic_name: str
+    top_k: int = 3
+
+
+@app.post("/predict/upload_oss", response_model=ClothesClassificationResponse)
+async def predict_upload_oss(request: PredictUploadOssRequest):
+    """通过OSS地址获取图片进行预测"""
+    if model is None:
+        raise HTTPException(status_code=503, detail="模型未加载")
+
+    start_time_pred = time.time()
+
+    try:
+        image_bytes = pants_workflow_service.fetch_image_from_oss(request.pic_name)
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail=f"无法从OSS获取图片: {request.pic_name}")
+
+        image_tensor = preprocess_image_from_bytes(image_bytes)
+        predictions = predict_image_tensor(image_tensor, request.top_k)
+
+        processing_time = time.time() - start_time_pred
+
+        return ClothesClassificationResponse(
+            success=True,
+            message="预测成功",
+            predictions=predictions,
+            processing_time=processing_time,
+            model_info={
+                "model_name": "enhanced-clothes-best",
+                "device": device
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OSS图片预测失败: {e}")
+        raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
+
+
 @app.post("/predict/base64", response_model=ClothesClassificationResponse)
 async def predict_base64(request: PredictionRequest):
     """通过base64编码的图片进行预测"""
